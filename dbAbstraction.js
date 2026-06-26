@@ -171,6 +171,20 @@ class DbAbstraction {
             throw err;
         }
     }
+    async insertMany (dbName, tableName, docs) {
+        try {
+            if (!docs || docs.length === 0) return { ok: 1, insertedCount: 0, insertedIds: {} };
+            if (! this.isConnected ) await this.connect();
+            let db = this.client.db(dbName);
+            let collection = db.collection(tableName);
+            let ret = await collection.insertMany(docs, { ordered: false });
+            return { ok: ret.acknowledged ? 1 : 0, insertedCount: ret.insertedCount, insertedIds: ret.insertedIds };
+        } catch (err) {
+            logger.error(err, `insertMany error for ${dbName}.${tableName}`);
+            this.handleDbErrors(err);
+            throw err;
+        }
+    }
     async insertOneUniquely (dbName, tableName, selector, setObj) {
         try {
             if (! this.isConnected ) await this.connect();
@@ -198,6 +212,11 @@ class DbAbstraction {
      * @param {Object} options - Options object
      * @param {boolean} options.insertOnly - If true, fails for existing docs; if false, updates them (default: false)
      * @returns {Promise<{ok: number, inserted: Array, updated: Array, failures: Array}>}
+     *
+     * A selectorObj may contain an `_id` (string or ObjectId). When it does, that entry is
+     * treated as an update-by-identity (same as insertOrUpdateOneDoc): the `_id` is converted to
+     * an ObjectId, the row is updated in place, and if no such row exists it is reported as a
+     * `Row not found!` failure (never inserted). Selectors without `_id` keep upsert-by-key behavior.
      */
     async upsertMany(dbName, tableName, selectorObjs, docs, options = {}) {
         const { insertOnly = false } = options;
@@ -206,36 +225,40 @@ class DbAbstraction {
             let db = this.client.db(dbName);
             let collection = db.collection(tableName);
 
-            // Validate arrays are same length
             if (selectorObjs.length !== docs.length) {
                 return { ok: 0, error: 'selectorObjs and docs arrays must be same length' };
             }
 
-            // Check for _id in selectors
+            // An `_id` marks an update-by-identity entry (convert it to ObjectId); drop `_id` from
+            // the doc payload so no row is ever inserted with a custom _id.
+            const idBased = new Array(selectorObjs.length).fill(false);
             for (let i = 0; i < selectorObjs.length; i++) {
                 if (selectorObjs[i]._id) {
-                    return { ok: 0, error: `selectorObjs[${i}] must not have _id` };
+                    selectorObjs[i]._id = this.getObjectId(selectorObjs[i]._id);
+                    idBased[i] = true;
+                }
+                if (docs[i] && docs[i]._id !== undefined) {
+                    delete docs[i]._id;
                 }
             }
 
-            // Build bulkWrite operations
+            // _id-based selectors update an existing row only (upsert: false, never insert a stray
+            // doc); natural-key selectors keep upsert-by-key behavior.
             const bulkOps = selectorObjs.map((selector, index) => ({
                 updateOne: {
                     filter: selector,
                     update: insertOnly ? { $setOnInsert: docs[index] } : { $set: docs[index] },
-                    upsert: true
+                    upsert: !idBased[index]
                 }
             }));
 
-            // Execute bulk operation with ordered: false to continue on errors
-            const result = await collection.bulkWrite(bulkOps, { ordered: false });
+            // ordered: ops run in array order and stop at the first failing op.
+            const result = await collection.bulkWrite(bulkOps, { ordered: true });
 
-            // Build inserted, updated, and failures arrays
             const inserted = [];
             const updated = [];
             const failures = [];
 
-            // Track which indices were upserted (new inserts)
             const upsertedIndices = new Set();
             if (result.upsertedIds) {
                 for (const [indexStr, id] of Object.entries(result.upsertedIds)) {
@@ -249,13 +272,36 @@ class DbAbstraction {
                 }
             }
 
-            // Process documents that already existed (matched)
+            // Resolve the _id of every doc that wasn't freshly inserted using one batched query
+            // instead of a findOne per row, then match results back to each selector in memory.
+            const pendingIndices = [];
             for (let i = 0; i < selectorObjs.length; i++) {
-                if (!upsertedIndices.has(i)) {
-                    // This doc already existed, find its _id
-                    const existingDoc = await collection.findOne(selectorObjs[i], { projection: { _id: 1 } });
-                    if (insertOnly) {
-                        // Insert-only mode: existing docs are failures
+                if (!upsertedIndices.has(i)) pendingIndices.push(i);
+            }
+
+            if (pendingIndices.length > 0) {
+                // Project the selector fields too so natural-key results can be matched back.
+                const projection = { _id: 1 };
+                for (const i of pendingIndices) {
+                    for (const key of Object.keys(selectorObjs[i])) projection[key] = 1;
+                }
+                const orConditions = pendingIndices.map(i => selectorObjs[i]);
+                const existingDocs = await collection.find({ $or: orConditions }, { projection }).toArray();
+
+                const byId = new Map();
+                for (const doc of existingDocs) byId.set(String(doc._id), doc);
+
+                for (const i of pendingIndices) {
+                    const existingDoc = idBased[i]
+                        ? byId.get(String(selectorObjs[i]._id))
+                        : existingDocs.find(doc => this._docMatchesSelector(doc, selectorObjs[i]));
+                    if (idBased[i] && !existingDoc) {
+                        failures.push({
+                            index: i,
+                            selectorObj: selectorObjs[i],
+                            error: 'Row not found!'
+                        });
+                    } else if (insertOnly) {
                         failures.push({
                             index: i,
                             selectorObj: selectorObjs[i],
@@ -263,7 +309,6 @@ class DbAbstraction {
                             existingId: existingDoc ? existingDoc._id : null
                         });
                     } else {
-                        // Upsert mode: existing docs were updated successfully
                         updated.push({
                             index: i,
                             _id: existingDoc ? existingDoc._id : null,
@@ -288,6 +333,26 @@ class DbAbstraction {
             this.handleDbErrors(err);
             throw err;
         }
+    }
+
+    /**
+     * Returns true if `doc` satisfies every field-equality in `selector`.
+     * Handles ObjectId (and other BSON types exposing `.equals`) and falls back to a
+     * structural compare for nested objects/arrays. Assumes equality-style selectors.
+     */
+    _docMatchesSelector(doc, selector) {
+        for (const key of Object.keys(selector)) {
+            const sv = selector[key];
+            const dv = doc[key];
+            if (sv && typeof sv === 'object' && typeof sv.equals === 'function') {
+                if (!(dv && typeof dv.equals === 'function' && sv.equals(dv))) return false;
+            } else if (sv !== null && typeof sv === 'object') {
+                if (JSON.stringify(sv) !== JSON.stringify(dv)) return false;
+            } else if (dv !== sv) {
+                return false;
+            }
+        }
+        return true;
     }
 
     async update (dbName, tableName, selector, updateObj) {

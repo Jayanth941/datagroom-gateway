@@ -1220,7 +1220,42 @@ router.post('/view/upsertBulkDocs', async (req, res, next) => {
     let dbAbstraction = new DbAbstraction();
     try {
         const insertOnly = request.insertOnly === true;
-        let dbResponse = await dbAbstraction.upsertMany(request.dsName, "data", request.selectorObjs, request.docs, { insertOnly });
+
+        // Per-row access enforcement (mirrors insertOrUpdateOneDoc): _id-based selectors the user
+        // can't access are dropped and reported as 'Row not found!'. Natural-key selectors (no _id)
+        // pass through unchanged, since the single-doc path only checks access when _id is present.
+        let idStrings = [];
+        for (const sel of request.selectorObjs) {
+            if (sel && sel._id) idStrings.push(String(sel._id));
+        }
+        let allowedIdSet = idStrings.length > 0
+            ? await PerRowAcessCheck.checkAccessForSpecificRows(request.dsName, request.dsView, request.dsUser, idStrings)
+            : new Set();
+
+        let allowedSelectorObjs = [];
+        let allowedDocs = [];
+        let accessFailures = [];
+        for (let i = 0; i < request.selectorObjs.length; i++) {
+            let sel = request.selectorObjs[i];
+            if (sel && sel._id) {
+                if (allowedIdSet.has(String(sel._id))) {
+                    allowedSelectorObjs.push(sel);
+                    allowedDocs.push(request.docs[i]);
+                } else {
+                    accessFailures.push({ selectorObj: sel, error: 'Row not found!' });
+                }
+            } else {
+                allowedSelectorObjs.push(sel);
+                allowedDocs.push(request.docs[i]);
+            }
+        }
+
+        let dbResponse;
+        if (allowedSelectorObjs.length > 0) {
+            dbResponse = await dbAbstraction.upsertMany(request.dsName, "data", allowedSelectorObjs, allowedDocs, { insertOnly });
+        } else {
+            dbResponse = { ok: 1, insertedCount: 0, updatedCount: 0, failCount: 0, inserted: [], updated: [], failures: [] };
+        }
         logger.info(dbResponse, 'DB response after upsertMany');
 
         if (dbResponse.ok !== 1) {
@@ -1228,10 +1263,12 @@ router.post('/view/upsertBulkDocs', async (req, res, next) => {
             return;
         }
 
-        // Determine overall status
+        let failures = [...dbResponse.failures, ...accessFailures];
+        let failCount = dbResponse.failCount + accessFailures.length;
+
         let status;
         const successCount = dbResponse.insertedCount + dbResponse.updatedCount;
-        if (dbResponse.failCount === 0) {
+        if (failCount === 0) {
             status = 'success';
         } else if (successCount === 0) {
             status = 'fail';
@@ -1239,41 +1276,41 @@ router.post('/view/upsertBulkDocs', async (req, res, next) => {
             status = 'partial';
         }
 
-        // Create editlog entries for inserted docs
+        // item.index refers to allowedDocs (the filtered arrays actually sent to upsertMany).
+        let editLogEntries = [];
         for (const item of dbResponse.inserted) {
-            let editLogEntry = {
+            editLogEntries.push({
                 opr: "insert",
                 selector: JSON.stringify(item.selectorObj, null, 4),
-                doc: JSON.stringify(request.docs[item.index], null, 4),
+                doc: JSON.stringify(allowedDocs[item.index], null, 4),
                 user: request.dsUser,
                 date: Date(),
                 status: 'success'
-            };
-            await dbAbstraction.insertOne(request.dsName, "editlog", editLogEntry);
+            });
         }
-
-        // Create editlog entries for updated docs
         for (const item of dbResponse.updated) {
-            let editLogEntry = {
+            editLogEntries.push({
                 opr: "update",
                 selector: JSON.stringify(item.selectorObj, null, 4),
-                doc: JSON.stringify(request.docs[item.index], null, 4),
+                doc: JSON.stringify(allowedDocs[item.index], null, 4),
                 user: request.dsUser,
                 date: Date(),
                 status: 'success'
-            };
-            await dbAbstraction.insertOne(request.dsName, "editlog", editLogEntry);
+            });
+        }
+        if (editLogEntries.length > 0) {
+            await dbAbstraction.insertMany(request.dsName, "editlog", editLogEntries);
         }
 
         let response = {
             status,
-            total: dbResponse.total,
+            total: request.selectorObjs.length,
             insertedCount: dbResponse.insertedCount,
             updatedCount: dbResponse.updatedCount,
-            failCount: dbResponse.failCount,
+            failCount: failCount,
             inserted: dbResponse.inserted.map(s => ({ _id: s._id, selectorObj: s.selectorObj })),
             updated: dbResponse.updated.map(s => ({ _id: s._id, selectorObj: s.selectorObj })),
-            failures: dbResponse.failures.map(f => ({ selectorObj: f.selectorObj, error: f.error, existingId: f.existingId }))
+            failures: failures.map(f => ({ selectorObj: f.selectorObj, error: f.error, existingId: f.existingId }))
         };
 
         res.status(200).send(response);

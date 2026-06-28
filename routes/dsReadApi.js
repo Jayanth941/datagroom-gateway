@@ -874,6 +874,17 @@ function getInsertLog (req, status) {
     return insertDoc;
 }
 
+function getUpdateLog (req, status) {
+    let updateDoc = {};
+    updateDoc.opr = "update";
+    updateDoc.selector = JSON.stringify(req.selectorObj, null, 4);
+    updateDoc.doc = JSON.stringify(req.doc, null, 4);
+    updateDoc.user = req.dsUser;
+    updateDoc.date = Date();
+    updateDoc.status = status;
+    return updateDoc;
+}
+
 function getDeleteLog (req, _doc, status) {
     let selectorObj = JSON.parse(JSON.stringify(req.selectorObj));
     logger.info(_doc, `In getDeleteLog`);
@@ -1205,7 +1216,7 @@ router.post('/view/upsertBulkDocs', async (req, res, next) => {
         res.status(400).json({ status: 'fail', error: 'selectorObjs and docs arrays must be same length' });
         return;
     }
-    if (request.selectorObjs.length === 0) {
+    if (request.selectorObjs.length === 0 || request.docs.length === 0) {
         res.status(400).json({ status: 'fail', error: 'selectorObjs and docs arrays cannot be empty' });
         return;
     }
@@ -1221,9 +1232,6 @@ router.post('/view/upsertBulkDocs', async (req, res, next) => {
     try {
         const insertOnly = request.insertOnly === true;
 
-        // Per-row access enforcement (mirrors insertOrUpdateOneDoc): _id-based selectors the user
-        // can't access are dropped and reported as 'Row not found!'. Natural-key selectors (no _id)
-        // pass through unchanged, since the single-doc path only checks access when _id is present.
         let idStrings = [];
         for (const sel of request.selectorObjs) {
             if (sel && sel._id) idStrings.push(String(sel._id));
@@ -1279,24 +1287,10 @@ router.post('/view/upsertBulkDocs', async (req, res, next) => {
         // item.index refers to allowedDocs (the filtered arrays actually sent to upsertMany).
         let editLogEntries = [];
         for (const item of dbResponse.inserted) {
-            editLogEntries.push({
-                opr: "insert",
-                selector: JSON.stringify(item.selectorObj, null, 4),
-                doc: JSON.stringify(allowedDocs[item.index], null, 4),
-                user: request.dsUser,
-                date: Date(),
-                status: 'success'
-            });
+            editLogEntries.push(getInsertLog({ selectorObj: item.selectorObj, doc: allowedDocs[item.index], dsUser: request.dsUser }, 'success'));
         }
         for (const item of dbResponse.updated) {
-            editLogEntries.push({
-                opr: "update",
-                selector: JSON.stringify(item.selectorObj, null, 4),
-                doc: JSON.stringify(allowedDocs[item.index], null, 4),
-                user: request.dsUser,
-                date: Date(),
-                status: 'success'
-            });
+            editLogEntries.push(getUpdateLog({ selectorObj: item.selectorObj, doc: allowedDocs[item.index], dsUser: request.dsUser }, 'success'));
         }
         if (editLogEntries.length > 0) {
             await dbAbstraction.insertMany(request.dsName, "editlog", editLogEntries);

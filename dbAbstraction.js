@@ -212,11 +212,6 @@ class DbAbstraction {
      * @param {Object} options - Options object
      * @param {boolean} options.insertOnly - If true, fails for existing docs; if false, updates them (default: false)
      * @returns {Promise<{ok: number, inserted: Array, updated: Array, failures: Array}>}
-     *
-     * A selectorObj may contain an `_id` (string or ObjectId). When it does, that entry is
-     * treated as an update-by-identity (same as insertOrUpdateOneDoc): the `_id` is converted to
-     * an ObjectId, the row is updated in place, and if no such row exists it is reported as a
-     * `Row not found!` failure (never inserted). Selectors without `_id` keep upsert-by-key behavior.
      */
     async upsertMany(dbName, tableName, selectorObjs, docs, options = {}) {
         const { insertOnly = false } = options;
@@ -242,8 +237,6 @@ class DbAbstraction {
                 }
             }
 
-            // _id-based selectors update an existing row only (upsert: false, never insert a stray
-            // doc); natural-key selectors keep upsert-by-key behavior.
             const bulkOps = selectorObjs.map((selector, index) => ({
                 updateOne: {
                     filter: selector,
@@ -252,7 +245,6 @@ class DbAbstraction {
                 }
             }));
 
-            // ordered: ops run in array order and stop at the first failing op.
             const result = await collection.bulkWrite(bulkOps, { ordered: true });
 
             const inserted = [];
@@ -272,8 +264,6 @@ class DbAbstraction {
                 }
             }
 
-            // Resolve the _id of every doc that wasn't freshly inserted using one batched query
-            // instead of a findOne per row, then match results back to each selector in memory.
             const pendingIndices = [];
             for (let i = 0; i < selectorObjs.length; i++) {
                 if (!upsertedIndices.has(i)) pendingIndices.push(i);
@@ -295,24 +285,34 @@ class DbAbstraction {
                     const existingDoc = idBased[i]
                         ? byId.get(String(selectorObjs[i]._id))
                         : existingDocs.find(doc => this._docMatchesSelector(doc, selectorObjs[i]));
-                    if (idBased[i] && !existingDoc) {
-                        failures.push({
-                            index: i,
-                            selectorObj: selectorObjs[i],
-                            error: 'Row not found!'
-                        });
-                    } else if (insertOnly) {
-                        failures.push({
-                            index: i,
-                            selectorObj: selectorObjs[i],
-                            error: 'Document with matching key already exists',
-                            existingId: existingDoc ? existingDoc._id : null
-                        });
-                    } else {
+                    if (insertOnly) {
+                        if (existingDoc) {
+                            failures.push({
+                                index: i,
+                                selectorObj: selectorObjs[i],
+                                error: 'Document with matching key already exists',
+                                existingId: existingDoc._id
+                            });
+                        } else {
+                            // Neither matched nor upserted: the insert did not happen.
+                            failures.push({
+                                index: i,
+                                selectorObj: selectorObjs[i],
+                                error: idBased[i] ? 'Row not found!' : 'Insert did not happen'
+                            });
+                        }
+                    } else if (existingDoc) {
                         updated.push({
                             index: i,
-                            _id: existingDoc ? existingDoc._id : null,
+                            _id: existingDoc._id,
                             selectorObj: selectorObjs[i]
+                        });
+                    } else {
+                        // No row to update, and (for _id-based) no insert is allowed.
+                        failures.push({
+                            index: i,
+                            selectorObj: selectorObjs[i],
+                            error: idBased[i] ? 'Row not found!' : 'Update/insert did not happen'
                         });
                     }
                 }
